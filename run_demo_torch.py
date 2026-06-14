@@ -1,7 +1,125 @@
 """
-KV Cache Live Demo — PyTorch edition.
-Run: python3 run_demo_torch.py
-Run one demo: python3 run_demo_torch.py 1
+================================================================================
+FILE: run_demo_torch.py
+PURPOSE: Interactive terminal demos of KV cache behaviour using PyTorch.
+         Focuses on showing real tensor shapes at every step so you can
+         see exactly what happens to Q, K, V dimensions during prefill
+         and decode. Upgrade from run_demo.py if you have PyTorch installed.
+
+DIFFERENCE FROM run_demo.py
+----------------------------
+  run_demo.py       — pure NumPy, no framework needed, focuses on concepts
+  run_demo_torch.py — PyTorch nn.Module, shows real shapes, GQA support,
+                      timing with torch.no_grad(), prefix cache with saved state
+
+WHAT IS IMPLEMENTED
+--------------------
+  AttentionLayer(kv_heads)
+  ─────────────────────────
+  A single transformer attention layer with KV cache built in.
+  Supports GQA: pass kv_heads < 8 for fewer KV heads.
+  When kv_heads < H, uses repeat_interleave to expand KV for attention.
+
+  TinyLM(vocab_size, kv_heads)
+  ─────────────────────────────
+  A 4-layer, 8-head transformer language model with:
+    - Embedding layer (vocab → d_model vectors)
+    - 4 × AttentionLayer (each with its own KV cache)
+    - LayerNorm after each attention
+    - LM head (d_model → vocab logits)
+  Two modes:
+    .prefill(token_ids)         — process full prompt, fill all 4 layer caches
+    .decode_step(token_id)      — generate one token using all 4 caches
+
+  Properties:
+    model.cache_tokens          — tokens currently stored across all layers
+    model.cache_bytes()         — total bytes across all 4 layer caches (float32)
+
+THE 5 DEMOS
+-----------
+
+  DEMO 1 — Tensor Shapes at Every Step
+  ───────────────────────────────────────
+  What it does: Runs a 6-token prefill then 4 decode steps.
+                At each step, prints the exact shape of every tensor.
+  What you see during PREFILL:
+    Input:   token_ids  shape = 1×6
+    Embed:   1×6×256    (6 tokens, each 256-dimensional)
+    Q:       1×8×6×32   (batch × heads × seq × head_dim)
+    K:       1×8×6×32   ← these get stored in cache
+    V:       1×8×6×32   ← these get stored in cache
+    QK^T:    1×8×6×6    (attention score matrix, T×T)
+    softmax: 1×8×6×6    (same shape, values sum to 1 per row)
+    Cache after prefill: [1, 8, 6, 32] — 6 tokens stored
+    Total across 4 layers: XX.X KB
+
+  What you see during each DECODE step:
+    New token input: 1×1     ← only ONE token!
+    Q (new token):   1×8×1×32  ← Q has 1 in the T position (not 6)
+    Cache before:    6 tokens
+    Cache after:     7 tokens (+1 appended)
+    K_full attends to: all 7 cached tokens
+
+  Why it matters: The contrast between prefill Q shape [1,8,6,32] and
+  decode Q shape [1,8,1,32] is the entire point of KV caching. The 1 in
+  decode means "only compute this one new query" — not the whole history.
+
+  DEMO 2 — Speed: Naive vs KV Cache
+  ────────────────────────────────────
+  What it does: Generates 25 tokens both ways from a 15-token prompt.
+                Naive re-runs full prefill on growing history each step.
+                KV Cache prefills once then decodes one token at a time.
+  What you see:
+    Naive:    time grows with each step as history lengthens
+    KV Cache: time stays roughly constant (same per-step work)
+    Table: avg ms/token and total ms for both
+  Key output: "KV Cache is X.Xx faster per decode token"
+
+  DEMO 3 — GQA: MHA vs GQA vs MQA
+  ──────────────────────────────────
+  What it does: Builds three TinyLM models — one with 8 KV heads (MHA),
+                one with 2 KV heads (GQA), one with 1 KV head (MQA).
+                All decode 50 tokens. Measures cache size and time.
+  What you see:
+    MHA  (8 KV heads): X KB cache   baseline
+    GQA  (2 KV heads): Y KB cache   4x smaller cache, ~same speed
+    MQA  (1 KV head):  Z KB cache   8x smaller cache, slightly faster
+  Why it matters: Shows the memory-quality tradeoff of GQA in practice.
+
+  DEMO 4 — Prefix Caching with Saved State
+  ──────────────────────────────────────────
+  What it does: Prefills a 30-token system prompt, saves all 4 layer caches,
+                then runs 5 different queries each starting from that saved state.
+                Compares timing vs full prefill from scratch each request.
+  What you see: Per-request timing table with speedup ratio.
+                "Prefix caching saves X% of prefill compute."
+  Why it matters: This is exactly how SGLang's RadixAttention and the Claude API
+                  cache_control parameter work under the hood.
+
+  DEMO 5 — Real Attention Weight Heatmap
+  ────────────────────────────────────────
+  What it does: Uses PyTorch's built-in nn.MultiheadAttention on
+                "The cat sat on the mat" (6 tokens) to compute real
+                attention weights averaged over 4 heads.
+  What you see:
+    6×6 weight matrix with Unicode shade characters (░▒▓█)
+    Row sums = 1.0 (proves softmax normalization)
+    "Most-attended key per query" — which word each word looks at most
+  Why it matters: Directly visualizes the attention mechanism. The diagonal
+                  is usually high (every word attends to itself strongly).
+                  Off-diagonal entries show learned token relationships.
+
+HOW TO RUN
+----------
+  python3 run_demo_torch.py          # run all 5 demos
+  python3 run_demo_torch.py 1        # run only Demo 1 (recommended first)
+  python3 run_demo_torch.py 1 2      # run Demos 1 and 2
+
+REQUIREMENTS
+------------
+  pip install torch   (CPU version is fine — no GPU needed)
+  For the numpy-only version, see run_demo.py.
+================================================================================
 """
 
 import torch

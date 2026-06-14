@@ -1,13 +1,109 @@
 """
-KV Cache Token Eviction Demo
-=============================
-Implements and compares 4 eviction strategies:
-  1. Full cache (baseline, no eviction)
-  2. H2O — cumulative attention score eviction
-  3. StreamingLLM — attention sinks + sliding window
-  4. SnapKV-style — observation window prediction at prefill
+================================================================================
+FILE: demo_eviction.py
+PURPOSE: Live interactive demos comparing 4 KV cache eviction strategies.
+         Run this file to see each method's cache size, eviction behaviour,
+         and attention weight preservation — all in the terminal.
 
-Run:  python3 demo_eviction.py
+BACKGROUND: THE EVICTION PROBLEM
+---------------------------------
+A standard KV cache keeps every token forever — the cache grows with every
+generated token and eventually fills your GPU's VRAM. Token eviction solves
+this by discarding tokens that are unlikely to be needed, keeping cache size
+bounded. The challenge: pick the wrong tokens to discard and model quality drops.
+
+THE 4 STRATEGIES IMPLEMENTED
+------------------------------
+
+  1. FullCache (baseline)
+     ─────────────────────
+     Keeps every token. Cache grows from prompt_length all the way to
+     prompt_length + generated_tokens. Reference point for comparison.
+     Class:  FullCache(d_model, n_heads)
+     Method: .prefill(tokens), .decode(tok), .size()
+
+  2. H2OCache — Heavy-Hitter Oracle
+     ─────────────────────────────────
+     Paper: arxiv:2306.14048 (Zhang et al., 2023)
+     Idea:  Track a cumulative attention score for each cached token.
+            Every decode step, add the attention weights each token received.
+            When cache exceeds budget, evict the token with the lowest score.
+     Result: Tokens that are repeatedly attended to ("heavy hitters") survive.
+             Tokens ignored by the model are dropped.
+     Class:  H2OCache(d_model, n_heads, budget)
+             self.scores[T] — running importance per token
+             self.evicted   — count of tokens dropped so far
+
+  3. StreamingLLMCache — Attention Sinks + Sliding Window
+     ───────────────────────────────────────────────────────
+     Paper: arxiv:2309.17453 (Xiao et al., 2023)
+     Key finding: the very first tokens (especially [BOS]) always receive
+     disproportionate attention — NOT because they are semantically important,
+     but because the model learned to "dump" unused attention there. Dropping
+     them collapses model quality even if they are irrelevant.
+     Fix:   Keep first sink_size tokens permanently ("attention sinks") AND
+            keep a sliding window of the last window_size recent tokens.
+     Result: Cache size is FIXED at (sink_size + window_size) regardless of
+             total sequence length → infinite-length generation possible.
+     Class:  StreamingLLMCache(d_model, n_heads, sink_size=4, window_size=64)
+             self.sink_k / self.sink_v — never evicted
+             self.win_k  / self.win_v  — slides forward
+
+  4. SnapKVCache — Observation Window Prediction
+     ───────────────────────────────────────────────
+     Paper: arxiv:2404.14469 (Li et al., 2024)
+     Idea:  At PREFILL TIME (before generation begins), use the last
+            obs_window tokens of the prompt as "observation queries."
+            Compute which prefix tokens the observation window attends to most.
+            Keep only those top-budget tokens in the cache.
+     Result: Cache is pruned once at prefill — no eviction during generation.
+             3.6x speed and 8.2x memory improvement at 16K tokens (verified).
+     Class:  SnapKVCache(d_model, n_heads, budget, obs_window=16)
+
+THE 4 DEMOS
+-----------
+
+  DEMO 1 — Cache Size Over Time
+  ──────────────────────────────
+  All 4 strategies prefill 40 tokens, then generate 30 tokens.
+  Prints cache size at every step as a bar chart:
+    Full:   41 → 42 → 43 → ... → 70  (grows forever)
+    H2O:    hits budget=20, stays flat
+    Stream: hits sink+window=20, stays flat
+    SnapKV: grows (no eviction during decode; budget was spent at prefill)
+
+  DEMO 2 — How Eviction Shifts Attention Weights
+  ─────────────────────────────────────────────────
+  Shows that H2O correctly preserves the tokens that matter most.
+  Tokens at positions 5-10 are given 5x larger magnitude → they dominate
+  attention. Measures which top-5 positions survive under different budgets:
+    budget=25 → 5/5 match with full cache  (no quality loss)
+    budget=15 → 5/5 match                  (still fine)
+    budget=5  → 3/5 match                  (some degradation)
+
+  DEMO 3 — H2O Eviction Trace
+  ─────────────────────────────
+  Step-by-step trace of H2O running with budget=6 on 8 prompt tokens.
+  Tokens 2 and 5 are injected with large magnitude to attract attention.
+  Prints which tokens have highest cumulative scores after each step.
+  Shows: high-magnitude tokens (2, 5) survive; unimportant tokens evicted.
+
+  DEMO 4 — StreamingLLM Infinite Context
+  ────────────────────────────────────────
+  30 total tokens processed. Cache cap = sink(3) + window(8) = 11.
+  Prints total tokens seen vs cache size at every step.
+  After step 11, cache stays at 11 forever while total_seen keeps growing.
+
+HOW TO RUN
+----------
+  python3 demo_eviction.py          # run all 4 demos
+  python3 demo_eviction.py 1        # run only Demo 1
+  python3 demo_eviction.py 3 4      # run Demos 3 and 4
+
+NOTE: These are plain Python classes (no nn.Module). For PyTorch nn.Module
+versions of the same algorithms with full prefill/decode support, see
+06_code_examples.py (H2OAttention, StreamingLLMAttention).
+================================================================================
 """
 
 import torch

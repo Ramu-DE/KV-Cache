@@ -1,7 +1,118 @@
 """
-KV Cache Live Demo — pure numpy, no PyTorch needed.
-Run: python3 run_demo.py
-Run one demo: python3 run_demo.py 1
+================================================================================
+FILE: run_demo.py
+PURPOSE: Interactive terminal demos of KV cache behaviour built with pure
+         NumPy — no PyTorch required. Run this first if you cannot install
+         PyTorch, or want to understand the math without a framework.
+
+WHY NUMPY?
+----------
+Implementing attention in NumPy forces you to see every matrix multiplication
+explicitly. There are no .forward() magic methods, no autograd graphs — just
+arrays and math. This makes it easier to trace exactly what gets cached,
+what gets recomputed, and how memory grows.
+
+WHAT IS IMPLEMENTED (from scratch, no libraries)
+-------------------------------------------------
+  softmax(x)          — numerically stable softmax (subtracts max first to
+                         prevent overflow: e^(x - max) instead of e^x)
+
+  attention(Q, K, V)  — scaled dot-product attention: Q @ K^T / √d_k → softmax → V
+
+  Config              — small dataclass holding d_model, layers, heads, head_dim
+
+  NaiveLayer          — baseline: recomputes ALL K,V from scratch every step
+  CachedLayer         — KV cache: stores K,V, only projects new token each step
+                        Supports GQA: num_kv_heads < num_q_heads reduces cache size
+  SlidingLayer        — sliding window: oldest tokens evicted when cache > window
+
+THE 7 DEMOS
+-----------
+
+  DEMO 1 — Speed: No Cache vs KV Cache
+  ───────────────────────────────────────
+  What it does: Generates 30 tokens with both NaiveLayer and CachedLayer.
+                Measures wall-clock time for each decode step.
+  What you see:
+    No Cache:  each step gets slower as history grows (more re-computation)
+    KV Cache:  steps stay roughly constant (only new token projected)
+    Table at end: avg ms/token and total ms for both methods
+  Key output: "KV Cache is X.Xx faster per token"
+  Why it matters: This is the core speedup. At T=50 tokens, ~5x. At T=2000,
+                  the gap would be ~2000x.
+
+  DEMO 2 — Memory: MHA vs GQA vs MQA
+  ─────────────────────────────────────
+  What it does: Calculates cache memory for Llama-2 7B (32 layers, 128 head_dim)
+                using the formula: 2 × layers × kv_heads × T × head_dim × 2 bytes
+  What you see:
+    MHA  (32 KV heads): 524 KB/token → 2.15 GB at 4K context
+    GQA  (8 KV heads):  131 KB/token → 537 MB  (4x smaller)
+    GQA  (4 KV heads):  66 KB/token  → 268 MB  (8x smaller)
+    MQA  (1 KV head):   16 KB/token  → 67 MB   (32x smaller)
+  Why it matters: These are the real numbers production systems deal with.
+
+  DEMO 3 — Cache Growth Trace
+  ─────────────────────────────
+  What it does: Runs 15 decode steps with a CachedLayer on a 5-token prompt.
+                After each step, prints cache token count + size in KB + bar.
+  What you see: Cache grows by exactly one row per decode step.
+                Each new word appended shows at the end of the sentence.
+  Why it matters: Makes the "cache is just appending rows" concept concrete.
+
+  DEMO 4 — Sliding Window Fixed Memory
+  ───────────────────────────────────────
+  What it does: Runs 20 tokens through both CachedLayer and SlidingLayer
+                (window=6). Prints both cache sizes side by side.
+  What you see:
+    Normal:   2 → 3 → 4 → ... → 20  (grows forever)
+    Sliding:  2 → 3 → 4 → 5 → 6 → 6 → 6 → ...  (capped at 6)
+    "← old tokens evicted" annotation appears when cap is reached
+  Why it matters: Shows the memory vs. context tradeoff directly.
+
+  DEMO 5 — Prefix Caching Speedup
+  ────────────────────────────────
+  What it does: Simulates 6 requests that share the same 40-token system prompt
+                but have different 5-token queries. Times both approaches:
+                  Without prefix cache: recompute system prompt KV every request
+                  With prefix cache:    compute system prompt KV once, reuse
+  What you see: Table showing per-request time and speedup (Xx) for each.
+                "Prefix caching saves X% of prefill time" summary.
+  Why it matters: In production (Claude API, OpenAI, SGLang), shared system
+                  prompts can be cached — this demo shows the actual savings.
+
+  DEMO 6 — Attention Weight Heatmap
+  ────────────────────────────────────
+  What it does: Runs full attention on "The quick brown fox jumps over the mat"
+                (8 tokens). Prints the averaged attention weight matrix.
+  What you see: A grid where each cell shows how much each word attends to
+                each previous word. Upper triangle = "· ·" (masked, future).
+                Diagonal is usually high (self-attention).
+                Top 4 attention pairs printed with bar chart.
+  Why it matters: Shows attention is not uniform — structure emerges even with
+                  random weights.
+
+  DEMO 7 — GQA vs MHA Timing
+  ────────────────────────────
+  What it does: Runs 55 decode steps with MHA (8 KV heads), GQA (2 KV heads),
+                and MQA (1 KV head). Measures total decode time for each.
+  What you see:
+    MHA  (8 KV heads): X ms   (baseline)
+    GQA  (2 KV heads): Y ms   (4x smaller cache, slightly faster)
+    MQA  (1 KV head):  Z ms   (8x smaller cache, fastest)
+  Why it matters: Fewer KV heads → less data to read per step → faster decode.
+
+HOW TO RUN
+----------
+  python3 run_demo.py          # run all 7 demos in sequence
+  python3 run_demo.py 1        # run only Demo 1
+  python3 run_demo.py 3 5 7    # run Demos 3, 5, and 7
+
+REQUIREMENTS
+------------
+  numpy only — no PyTorch, no GPU needed.
+  For PyTorch versions of the same experiments, see run_demo_torch.py.
+================================================================================
 """
 
 import numpy as np
