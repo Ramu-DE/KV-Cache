@@ -1,28 +1,46 @@
 """
 KV Cache — Chapter 6: Code Examples
-Building KV Cache from scratch in Python/PyTorch
+Building KV Cache, GQA, MLA, H2O, and StreamingLLM from scratch in PyTorch.
+
+Run:  python3 06_code_examples.py
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import time
 
 
 # ─────────────────────────────────────────────────────────────────
-# EXAMPLE 1: Naive Attention (No Cache) — baseline
+# SHARED UTILITY
+# ─────────────────────────────────────────────────────────────────
+
+def causal_mask(T: int, device=None) -> torch.Tensor:
+    """Upper-triangular bool mask — True = position must be masked out."""
+    return torch.triu(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1)
+
+
+def cache_bytes(tensor: torch.Tensor, dtype_bytes: int = 2) -> int:
+    """Bytes a tensor would occupy in float16."""
+    return tensor.numel() * dtype_bytes
+
+
+# ─────────────────────────────────────────────────────────────────
+# EXAMPLE 1: Naive Attention (No Cache) — O(n²) per step
 # ─────────────────────────────────────────────────────────────────
 
 class NaiveAttention(nn.Module):
     """
-    Recomputes Q, K, V for ALL tokens every step.
-    O(n²) cost — gets slower with every token generated.
+    Recomputes Q, K, V for ALL past tokens on every decode step.
+    Total cost: O(n³). Catastrophic for long sequences.
     """
     def __init__(self, d_model: int, num_heads: int):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.scale = math.sqrt(self.head_dim)
+        assert d_model % num_heads == 0
+        self.H  = num_heads
+        self.Hd = d_model // num_heads
+        self.scale = self.Hd ** -0.5
 
         self.W_q = nn.Linear(d_model, d_model, bias=False)
         self.W_k = nn.Linear(d_model, d_model, bias=False)
@@ -30,118 +48,90 @@ class NaiveAttention(nn.Module):
         self.W_o = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [batch, seq_len, d_model]
-        Computes Q, K, V for ALL tokens in x each call.
-        """
+        """x: [B, T, D] — the ENTIRE sequence so far, reprocessed each step."""
         B, T, D = x.shape
-        H, Hd = self.num_heads, self.head_dim
+        H, Hd = self.H, self.Hd
 
-        # Compute Q, K, V for ALL tokens — expensive!
-        Q = self.W_q(x).view(B, T, H, Hd).transpose(1, 2)  # [B, H, T, Hd]
+        Q = self.W_q(x).view(B, T, H, Hd).transpose(1, 2)   # [B, H, T, Hd]
         K = self.W_k(x).view(B, T, H, Hd).transpose(1, 2)
         V = self.W_v(x).view(B, T, H, Hd).transpose(1, 2)
 
-        # Attention scores
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [B, H, T, T]
-
-        # Causal mask (can't attend to future tokens)
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        scores = scores.masked_fill(mask, float('-inf'))
-
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, V)
-
-        # Reshape and project
+        scores = (Q @ K.transpose(-2, -1)) * self.scale       # [B, H, T, T]
+        scores = scores.masked_fill(causal_mask(T, x.device), float('-inf'))
+        out = F.softmax(scores, dim=-1) @ V                   # [B, H, T, Hd]
         out = out.transpose(1, 2).contiguous().view(B, T, D)
         return self.W_o(out)
 
 
 # ─────────────────────────────────────────────────────────────────
-# EXAMPLE 2: KV Cache Attention
+# EXAMPLE 2: KV Cache Attention — O(n) per step
 # ─────────────────────────────────────────────────────────────────
 
 class KVCacheAttention(nn.Module):
     """
-    Maintains a KV cache across decode steps.
-    Only computes Q, K, V for the NEW token each step.
-    O(n) cost — much faster!
+    Standard Multi-Head Attention with KV cache.
+
+    Prefill:     process entire prompt once → fill cache
+    Decode step: project only the new token → append to cache
+                 → attend over full cached K, V
+
+    Per-step cost: O(T·d) instead of O(T²·d). At T=2000, ~2000x less work.
     """
     def __init__(self, d_model: int, num_heads: int):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.scale = math.sqrt(self.head_dim)
+        assert d_model % num_heads == 0
+        self.H  = num_heads
+        self.Hd = d_model // num_heads
+        self.scale = self.Hd ** -0.5
 
         self.W_q = nn.Linear(d_model, d_model, bias=False)
         self.W_k = nn.Linear(d_model, d_model, bias=False)
         self.W_v = nn.Linear(d_model, d_model, bias=False)
         self.W_o = nn.Linear(d_model, d_model, bias=False)
 
-        # KV Cache: starts empty, grows with each step
-        self.cache_k = None  # [B, H, seq_so_far, Hd]
-        self.cache_v = None  # [B, H, seq_so_far, Hd]
+        self.cache_k: torch.Tensor | None = None  # [B, H, T, Hd]
+        self.cache_v: torch.Tensor | None = None
 
     def reset_cache(self):
-        """Call this between different conversations/requests."""
-        self.cache_k = None
-        self.cache_v = None
+        self.cache_k = self.cache_v = None
+
+    @property
+    def cache_tokens(self) -> int:
+        return 0 if self.cache_k is None else self.cache_k.shape[2]
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Process the full input prompt.
-        Fills KV cache with all prompt tokens.
-        x: [batch, prompt_len, d_model]
-        """
+        """x: [B, T, D] — full prompt. Fills cache, returns output for all T tokens."""
         B, T, D = x.shape
-        H, Hd = self.num_heads, self.head_dim
+        H, Hd = self.H, self.Hd
 
         Q = self.W_q(x).view(B, T, H, Hd).transpose(1, 2)
         K = self.W_k(x).view(B, T, H, Hd).transpose(1, 2)
         V = self.W_v(x).view(B, T, H, Hd).transpose(1, 2)
 
-        # Store K and V in cache
-        self.cache_k = K  # [B, H, T, Hd]
-        self.cache_v = V
+        self.cache_k, self.cache_v = K.clone(), V.clone()
 
-        # Full attention over prompt
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        scores = scores.masked_fill(mask, float('-inf'))
-
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, V)
-        out = out.transpose(1, 2).contiguous().view(B, T, D)
-        return self.W_o(out)
+        scores = (Q @ K.transpose(-2, -1)) * self.scale
+        scores = scores.masked_fill(causal_mask(T, x.device), float('-inf'))
+        out = F.softmax(scores, dim=-1) @ V
+        return self.W_o(out.transpose(1, 2).contiguous().view(B, T, D))
 
     def decode_step(self, x_new: torch.Tensor) -> torch.Tensor:
-        """
-        Process ONE new token using the KV cache.
-        x_new: [batch, 1, d_model]  ← just the new token!
-        """
-        B, T_new, D = x_new.shape
-        assert T_new == 1, "decode_step processes one token at a time"
-        H, Hd = self.num_heads, self.head_dim
+        """x_new: [B, 1, D] — single new token. Appends to cache, returns output."""
+        B, _, D = x_new.shape
+        H, Hd = self.H, self.Hd
 
-        # Only compute Q, K, V for the NEW token
-        Q_new = self.W_q(x_new).view(B, 1, H, Hd).transpose(1, 2)  # [B, H, 1, Hd]
-        K_new = self.W_k(x_new).view(B, 1, H, Hd).transpose(1, 2)
-        V_new = self.W_v(x_new).view(B, 1, H, Hd).transpose(1, 2)
+        # Only project the one new token
+        Q = self.W_q(x_new).view(B, 1, H, Hd).transpose(1, 2)   # [B, H, 1, Hd]
+        K = self.W_k(x_new).view(B, 1, H, Hd).transpose(1, 2)
+        V = self.W_v(x_new).view(B, 1, H, Hd).transpose(1, 2)
 
-        # Append new K, V to cache
-        self.cache_k = torch.cat([self.cache_k, K_new], dim=2)  # [B, H, T+1, Hd]
-        self.cache_v = torch.cat([self.cache_v, V_new], dim=2)
+        # Append to cache
+        self.cache_k = torch.cat([self.cache_k, K], dim=2)       # [B, H, T+1, Hd]
+        self.cache_v = torch.cat([self.cache_v, V], dim=2)
 
-        T_total = self.cache_k.shape[2]
-
-        # Attention: new token's Q attends to ALL cached K, V
-        scores = torch.matmul(Q_new, self.cache_k.transpose(-2, -1)) / self.scale
-        # Shape: [B, H, 1, T_total] — no masking needed (new token is last)
-
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, self.cache_v)  # [B, H, 1, Hd]
-        out = out.transpose(1, 2).contiguous().view(B, 1, D)
-        return self.W_o(out)
+        # Q is [B, H, 1, Hd] — attends to full cache, no mask needed
+        out = F.softmax((Q @ self.cache_k.transpose(-2, -1)) * self.scale, dim=-1) @ self.cache_v
+        return self.W_o(out.transpose(1, 2).contiguous().view(B, 1, D))
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -150,180 +140,590 @@ class KVCacheAttention(nn.Module):
 
 class GroupedQueryAttention(nn.Module):
     """
-    GQA: multiple Q heads share fewer K, V heads.
-    Reduces KV cache size by (num_q_heads / num_kv_heads).
+    GQA (Ainslie et al., 2023 — arxiv:2305.13245).
+
+    num_kv_heads query heads share ONE K/V head each group.
+    Cache reduction: num_q_heads / num_kv_heads  (e.g. 4x for 32Q→8KV).
+
+    Used by: Llama-2 70B, Llama-3, Mistral, Gemma.
+    When num_kv_heads == num_q_heads: standard MHA
+    When num_kv_heads == 1:           Multi-Query Attention (MQA)
     """
     def __init__(self, d_model: int, num_q_heads: int, num_kv_heads: int):
         super().__init__()
         assert num_q_heads % num_kv_heads == 0, "Q heads must be divisible by KV heads"
+        self.Hq  = num_q_heads
+        self.Hkv = num_kv_heads
+        self.G   = num_q_heads // num_kv_heads   # Q heads per KV head
+        self.Hd  = d_model // num_q_heads
+        self.scale = self.Hd ** -0.5
 
-        self.num_q_heads = num_q_heads
-        self.num_kv_heads = num_kv_heads
-        self.groups = num_q_heads // num_kv_heads  # Q heads per KV head
-        self.head_dim = d_model // num_q_heads
-        self.scale = math.sqrt(self.head_dim)
-
-        self.W_q = nn.Linear(d_model, num_q_heads * self.head_dim, bias=False)
-        # KV projections are SMALLER: only num_kv_heads
-        self.W_k = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
-        self.W_v = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
+        self.W_q = nn.Linear(d_model, num_q_heads  * self.Hd, bias=False)
+        self.W_k = nn.Linear(d_model, num_kv_heads * self.Hd, bias=False)  # smaller!
+        self.W_v = nn.Linear(d_model, num_kv_heads * self.Hd, bias=False)  # smaller!
         self.W_o = nn.Linear(d_model, d_model, bias=False)
 
-        # Smaller KV cache!
-        self.cache_k = None  # [B, num_kv_heads, T, Hd]
-        self.cache_v = None
+        self.cache_k: torch.Tensor | None = None  # [B, Hkv, T, Hd]
+        self.cache_v: torch.Tensor | None = None
+
+    def reset_cache(self):
+        self.cache_k = self.cache_v = None
+
+    @property
+    def cache_tokens(self) -> int:
+        return 0 if self.cache_k is None else self.cache_k.shape[2]
+
+    def _expand_kv(self, K: torch.Tensor, V: torch.Tensor):
+        """Repeat each KV head G times to match Q heads. No data copy — view."""
+        B, Hkv, T, Hd = K.shape
+        K = K.unsqueeze(2).expand(B, Hkv, self.G, T, Hd).reshape(B, self.Hq, T, Hd)
+        V = V.unsqueeze(2).expand(B, Hkv, self.G, T, Hd).reshape(B, self.Hq, T, Hd)
+        return K, V
+
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, T, D] — full prompt."""
+        B, T, D = x.shape
+        Q = self.W_q(x).view(B, T, self.Hq,  self.Hd).transpose(1, 2)
+        K = self.W_k(x).view(B, T, self.Hkv, self.Hd).transpose(1, 2)
+        V = self.W_v(x).view(B, T, self.Hkv, self.Hd).transpose(1, 2)
+
+        self.cache_k, self.cache_v = K.clone(), V.clone()
+
+        Ke, Ve = self._expand_kv(K, V)
+        scores = (Q @ Ke.transpose(-2, -1)) * self.scale
+        scores = scores.masked_fill(causal_mask(T, x.device), float('-inf'))
+        out = F.softmax(scores, dim=-1) @ Ve
+        return self.W_o(out.transpose(1, 2).contiguous().view(B, T, D))
 
     def decode_step(self, x_new: torch.Tensor) -> torch.Tensor:
+        """x_new: [B, 1, D]."""
         B, _, D = x_new.shape
-        Hq, Hkv, G, Hd = self.num_q_heads, self.num_kv_heads, self.groups, self.head_dim
+        Q = self.W_q(x_new).view(B, 1, self.Hq,  self.Hd).transpose(1, 2)
+        K = self.W_k(x_new).view(B, 1, self.Hkv, self.Hd).transpose(1, 2)
+        V = self.W_v(x_new).view(B, 1, self.Hkv, self.Hd).transpose(1, 2)
 
-        Q = self.W_q(x_new).view(B, 1, Hq, Hd).transpose(1, 2)   # [B, Hq, 1, Hd]
-        K = self.W_k(x_new).view(B, 1, Hkv, Hd).transpose(1, 2)  # [B, Hkv, 1, Hd]
-        V = self.W_v(x_new).view(B, 1, Hkv, Hd).transpose(1, 2)
-
-        # Append to (smaller) KV cache
         self.cache_k = torch.cat([self.cache_k, K], dim=2) if self.cache_k is not None else K
         self.cache_v = torch.cat([self.cache_v, V], dim=2) if self.cache_v is not None else V
 
-        T = self.cache_k.shape[2]
+        Ke, Ve = self._expand_kv(self.cache_k, self.cache_v)
+        out = F.softmax((Q @ Ke.transpose(-2, -1)) * self.scale, dim=-1) @ Ve
+        return self.W_o(out.transpose(1, 2).contiguous().view(B, 1, D))
 
-        # Expand KV to match Q heads: each KV head serves G query heads
-        # [B, Hkv, T, Hd] → [B, Hkv, 1, T, Hd] → [B, Hkv, G, T, Hd] → [B, Hq, T, Hd]
-        K_expanded = self.cache_k.unsqueeze(2).expand(B, Hkv, G, T, Hd).reshape(B, Hq, T, Hd)
-        V_expanded = self.cache_v.unsqueeze(2).expand(B, Hkv, G, T, Hd).reshape(B, Hq, T, Hd)
-
-        scores = torch.matmul(Q, K_expanded.transpose(-2, -1)) / self.scale  # [B, Hq, 1, T]
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, V_expanded)  # [B, Hq, 1, Hd]
-        out = out.transpose(1, 2).contiguous().view(B, 1, D)
-        return self.W_o(out)
+    def kv_cache_bytes(self, dtype_bytes: int = 2) -> int:
+        if self.cache_k is None:
+            return 0
+        return (self.cache_k.numel() + self.cache_v.numel()) * dtype_bytes
 
 
 # ─────────────────────────────────────────────────────────────────
-# EXAMPLE 4: Sliding Window KV Cache
+# EXAMPLE 4: Multi-head Latent Attention (MLA)  — DeepSeek (2024)
+# ─────────────────────────────────────────────────────────────────
+
+class MLAAttention(nn.Module):
+    """
+    Multi-head Latent Attention (DeepSeek-V2/V3, 2024).
+
+    Instead of caching full K/V tensors (one per token per head),
+    cache a single LOW-RANK LATENT VECTOR per token.
+
+    At attention time: up-project latent → K, V on the fly.
+    The up-projection weights are model weights (stored once, not per token).
+
+    Cache size:  standard = 2 × H × Hd × T × bytes
+                 MLA      =     d_c        × T × bytes   (d_c << H × Hd)
+
+    Compression: ~5-13x over standard MHA, better than GQA.
+    """
+    def __init__(self, d_model: int, num_heads: int, latent_dim: int):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.H  = num_heads
+        self.Hd = d_model // num_heads
+        self.dc = latent_dim     # compressed latent dimension (d_c)
+        self.scale = self.Hd ** -0.5
+
+        # Q stays standard (not cached)
+        self.W_q = nn.Linear(d_model, num_heads * self.Hd, bias=False)
+
+        # KV compressed: token → latent (this is what gets cached)
+        self.W_kv_down = nn.Linear(d_model, latent_dim, bias=False)
+
+        # Latent → full K, V at attention time (model weights, not per-token)
+        self.W_k_up = nn.Linear(latent_dim, num_heads * self.Hd, bias=False)
+        self.W_v_up = nn.Linear(latent_dim, num_heads * self.Hd, bias=False)
+
+        self.W_o = nn.Linear(num_heads * self.Hd, d_model, bias=False)
+
+        # Cache stores LATENTS only — much smaller than K, V
+        self.cache_latent: torch.Tensor | None = None  # [B, T, d_c]
+
+    def reset_cache(self):
+        self.cache_latent = None
+
+    @property
+    def cache_tokens(self) -> int:
+        return 0 if self.cache_latent is None else self.cache_latent.shape[1]
+
+    def kv_cache_bytes(self, dtype_bytes: int = 2) -> int:
+        if self.cache_latent is None:
+            return 0
+        return self.cache_latent.numel() * dtype_bytes
+
+    def _latent_to_kv(self, latent: torch.Tensor):
+        """latent: [B, T, d_c] → K [B, H, T, Hd], V [B, H, T, Hd]"""
+        B, T, _ = latent.shape
+        K = self.W_k_up(latent).view(B, T, self.H, self.Hd).transpose(1, 2)
+        V = self.W_v_up(latent).view(B, T, self.H, self.Hd).transpose(1, 2)
+        return K, V
+
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, T, D]."""
+        B, T, D = x.shape
+        Q = self.W_q(x).view(B, T, self.H, self.Hd).transpose(1, 2)
+
+        # Compress and cache latent only
+        latent = self.W_kv_down(x)                   # [B, T, d_c]
+        self.cache_latent = latent.clone()
+
+        # Up-project for attention (not cached — computed from latent)
+        K, V = self._latent_to_kv(latent)
+        scores = (Q @ K.transpose(-2, -1)) * self.scale
+        scores = scores.masked_fill(causal_mask(T, x.device), float('-inf'))
+        out = F.softmax(scores, dim=-1) @ V
+        return self.W_o(out.transpose(1, 2).contiguous().view(B, T, D))
+
+    def decode_step(self, x_new: torch.Tensor) -> torch.Tensor:
+        """x_new: [B, 1, D]."""
+        B, _, D = x_new.shape
+        Q = self.W_q(x_new).view(B, 1, self.H, self.Hd).transpose(1, 2)
+
+        # Compress new token, append to latent cache
+        new_latent = self.W_kv_down(x_new)            # [B, 1, d_c]
+        self.cache_latent = (
+            torch.cat([self.cache_latent, new_latent], dim=1)
+            if self.cache_latent is not None else new_latent
+        )
+
+        # Up-project entire cache to K, V at decode time
+        K, V = self._latent_to_kv(self.cache_latent)
+        out = F.softmax((Q @ K.transpose(-2, -1)) * self.scale, dim=-1) @ V
+        return self.W_o(out.transpose(1, 2).contiguous().view(B, 1, D))
+
+
+# ─────────────────────────────────────────────────────────────────
+# EXAMPLE 5: Sliding Window KV Cache (Mistral-style)
 # ─────────────────────────────────────────────────────────────────
 
 class SlidingWindowAttention(nn.Module):
     """
-    Only keeps the last `window_size` tokens in the KV cache.
-    Fixed memory regardless of total sequence length!
+    Keeps only the last `window_size` tokens in the KV cache.
+    Fixed memory regardless of total sequence length.
+    Used by Mistral 7B (window = 4096).
     """
     def __init__(self, d_model: int, num_heads: int, window_size: int):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.scale = math.sqrt(self.head_dim)
-        self.window_size = window_size
+        assert d_model % num_heads == 0
+        self.H    = num_heads
+        self.Hd   = d_model // num_heads
+        self.W    = window_size
+        self.scale = self.Hd ** -0.5
 
         self.W_q = nn.Linear(d_model, d_model, bias=False)
         self.W_k = nn.Linear(d_model, d_model, bias=False)
         self.W_v = nn.Linear(d_model, d_model, bias=False)
         self.W_o = nn.Linear(d_model, d_model, bias=False)
 
-        self.cache_k = None
-        self.cache_v = None
+        self.cache_k: torch.Tensor | None = None
+        self.cache_v: torch.Tensor | None = None
+
+    @property
+    def cache_tokens(self) -> int:
+        return 0 if self.cache_k is None else self.cache_k.shape[2]
 
     def decode_step(self, x_new: torch.Tensor) -> torch.Tensor:
         B, _, D = x_new.shape
-        H, Hd = self.num_heads, self.head_dim
+        Q = self.W_q(x_new).view(B, 1, self.H, self.Hd).transpose(1, 2)
+        K = self.W_k(x_new).view(B, 1, self.H, self.Hd).transpose(1, 2)
+        V = self.W_v(x_new).view(B, 1, self.H, self.Hd).transpose(1, 2)
 
-        Q = self.W_q(x_new).view(B, 1, H, Hd).transpose(1, 2)
-        K = self.W_k(x_new).view(B, 1, H, Hd).transpose(1, 2)
-        V = self.W_v(x_new).view(B, 1, H, Hd).transpose(1, 2)
+        self.cache_k = torch.cat([self.cache_k, K], dim=2) if self.cache_k is not None else K
+        self.cache_v = torch.cat([self.cache_v, V], dim=2) if self.cache_v is not None else V
 
-        # Append to cache
-        if self.cache_k is None:
-            self.cache_k, self.cache_v = K, V
+        # Evict oldest tokens beyond window
+        if self.cache_k.shape[2] > self.W:
+            self.cache_k = self.cache_k[:, :, -self.W:, :]
+            self.cache_v = self.cache_v[:, :, -self.W:, :]
+
+        out = F.softmax((Q @ self.cache_k.transpose(-2, -1)) * self.scale, dim=-1) @ self.cache_v
+        return self.W_o(out.transpose(1, 2).contiguous().view(B, 1, D))
+
+
+# ─────────────────────────────────────────────────────────────────
+# EXAMPLE 6: StreamingLLM — Attention Sinks + Sliding Window
+# ─────────────────────────────────────────────────────────────────
+
+class StreamingLLMAttention(nn.Module):
+    """
+    StreamingLLM (Xiao et al., 2023 — arxiv:2309.17453).
+
+    Key finding: initial tokens ("attention sinks") always receive
+    disproportionate attention regardless of content. Dropping them
+    collapses model quality even if they are semantically irrelevant.
+
+    Fix: always keep the first `sink_size` tokens (sinks) AND
+         a sliding window of the last `window_size` tokens.
+
+    Cache = sink_size + window_size  (fixed, regardless of total length)
+    → Enables infinite-length generation / streaming.
+    """
+    def __init__(self, d_model: int, num_heads: int,
+                 sink_size: int = 4, window_size: int = 512):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.H    = num_heads
+        self.Hd   = d_model // num_heads
+        self.sink = sink_size
+        self.W    = window_size
+        self.scale = self.Hd ** -0.5
+
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
+
+        # Sinks are kept permanently; window slides
+        self.sink_k: torch.Tensor | None = None   # [B, H, sink, Hd]
+        self.sink_v: torch.Tensor | None = None
+        self.win_k:  torch.Tensor | None = None   # [B, H, ≤W, Hd]
+        self.win_v:  torch.Tensor | None = None
+
+    def reset_cache(self):
+        self.sink_k = self.sink_v = None
+        self.win_k  = self.win_v  = None
+
+    @property
+    def cache_tokens(self) -> int:
+        s = 0 if self.sink_k is None else self.sink_k.shape[2]
+        w = 0 if self.win_k  is None else self.win_k.shape[2]
+        return s + w
+
+    @property
+    def max_cache_tokens(self) -> int:
+        return self.sink + self.W
+
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, T, D]. Partitions into sinks + window."""
+        B, T, D = x.shape
+        Q = self.W_q(x).view(B, T, self.H, self.Hd).transpose(1, 2)
+        K = self.W_k(x).view(B, T, self.H, self.Hd).transpose(1, 2)
+        V = self.W_v(x).view(B, T, self.H, self.Hd).transpose(1, 2)
+
+        sink_end = min(self.sink, T)
+        self.sink_k = K[:, :, :sink_end, :]
+        self.sink_v = V[:, :, :sink_end, :]
+
+        remaining_k = K[:, :, sink_end:, :]
+        remaining_v = V[:, :, sink_end:, :]
+        if remaining_k.shape[2] > self.W:
+            remaining_k = remaining_k[:, :, -self.W:, :]
+            remaining_v = remaining_v[:, :, -self.W:, :]
+        self.win_k, self.win_v = remaining_k, remaining_v
+
+        K_all = torch.cat([self.sink_k, self.win_k], dim=2)
+        V_all = torch.cat([self.sink_v, self.win_v], dim=2)
+
+        # For prefill output, use full causal attention
+        scores = (Q @ K.transpose(-2, -1)) * self.scale
+        scores = scores.masked_fill(causal_mask(T, x.device), float('-inf'))
+        out = F.softmax(scores, dim=-1) @ V
+        return self.W_o(out.transpose(1, 2).contiguous().view(B, T, D))
+
+    def decode_step(self, x_new: torch.Tensor) -> torch.Tensor:
+        """x_new: [B, 1, D]."""
+        B, _, D = x_new.shape
+        Q = self.W_q(x_new).view(B, 1, self.H, self.Hd).transpose(1, 2)
+        K = self.W_k(x_new).view(B, 1, self.H, self.Hd).transpose(1, 2)
+        V = self.W_v(x_new).view(B, 1, self.H, self.Hd).transpose(1, 2)
+
+        # Append new token to window
+        self.win_k = torch.cat([self.win_k, K], dim=2) if self.win_k is not None else K
+        self.win_v = torch.cat([self.win_v, V], dim=2) if self.win_v is not None else V
+
+        # Slide window — evict oldest
+        if self.win_k.shape[2] > self.W:
+            self.win_k = self.win_k[:, :, -self.W:, :]
+            self.win_v = self.win_v[:, :, -self.W:, :]
+
+        K_all = torch.cat([self.sink_k, self.win_k], dim=2)
+        V_all = torch.cat([self.sink_v, self.win_v], dim=2)
+
+        out = F.softmax((Q @ K_all.transpose(-2, -1)) * self.scale, dim=-1) @ V_all
+        return self.W_o(out.transpose(1, 2).contiguous().view(B, 1, D))
+
+
+# ─────────────────────────────────────────────────────────────────
+# EXAMPLE 7: H2O — Heavy-Hitter Oracle (2023)
+# ─────────────────────────────────────────────────────────────────
+
+class H2OAttention(nn.Module):
+    """
+    H2O: Heavy-Hitter Oracle (Zhang et al., 2023 — arxiv:2306.14048).
+
+    Tracks cumulative attention score for every cached token.
+    When cache exceeds `budget`, evicts the lowest-scoring token.
+
+    Intuition: tokens that repeatedly receive high attention ("heavy hitters")
+    are kept; tokens that accumulate little attention are evicted.
+
+    Note: quality degradation depends on task. Reasoning tasks are more
+    sensitive than retrieval tasks to eviction aggressiveness.
+    """
+    def __init__(self, d_model: int, num_heads: int, budget: int):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.H      = num_heads
+        self.Hd     = d_model // num_heads
+        self.budget = budget
+        self.scale  = self.Hd ** -0.5
+
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
+
+        self.cache_k:  torch.Tensor | None = None
+        self.cache_v:  torch.Tensor | None = None
+        self.scores:   torch.Tensor | None = None   # cumulative importance [T]
+        self.n_evicted: int = 0
+
+    def reset_cache(self):
+        self.cache_k = self.cache_v = self.scores = None
+        self.n_evicted = 0
+
+    @property
+    def cache_tokens(self) -> int:
+        return 0 if self.cache_k is None else self.cache_k.shape[2]
+
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, T, D]. Fills cache and initialises importance scores."""
+        B, T, D = x.shape
+        Q = self.W_q(x).view(B, T, self.H, self.Hd).transpose(1, 2)
+        K = self.W_k(x).view(B, T, self.H, self.Hd).transpose(1, 2)
+        V = self.W_v(x).view(B, T, self.H, self.Hd).transpose(1, 2)
+
+        self.cache_k, self.cache_v = K.clone(), V.clone()
+
+        scores_mat = F.softmax((Q @ K.transpose(-2, -1)) * self.scale, dim=-1)
+        # Initialise importance = sum of attention received, averaged over heads and queries
+        self.scores = scores_mat.mean(dim=0).sum(dim=0)   # [T]
+
+        out = scores_mat @ V
+        return self.W_o(out.transpose(1, 2).contiguous().view(B, T, D))
+
+    def decode_step(self, x_new: torch.Tensor) -> torch.Tensor:
+        """x_new: [B, 1, D]. Computes attention, updates scores, evicts if needed."""
+        B, _, D = x_new.shape
+        Q = self.W_q(x_new).view(B, 1, self.H, self.Hd).transpose(1, 2)
+        K = self.W_k(x_new).view(B, 1, self.H, self.Hd).transpose(1, 2)
+        V = self.W_v(x_new).view(B, 1, self.H, self.Hd).transpose(1, 2)
+
+        K_all = torch.cat([self.cache_k, K], dim=2)
+        V_all = torch.cat([self.cache_v, V], dim=2)
+
+        attn = F.softmax((Q @ K_all.transpose(-2, -1)) * self.scale, dim=-1)
+        # attn: [B, H, 1, T+1] → step scores averaged over batch and heads
+        step_scores = attn[0].mean(dim=0).squeeze(0)   # [T+1]
+        new_scores  = torch.cat([self.scores, torch.zeros(1)]) + step_scores
+
+        # Evict lowest-scored token if over budget
+        if K_all.shape[2] > self.budget:
+            keep = new_scores.topk(self.budget).indices.sort().values
+            self.cache_k = K_all[:, :, keep, :]
+            self.cache_v = V_all[:, :, keep, :]
+            self.scores  = new_scores[keep]
+            self.n_evicted += 1
         else:
-            self.cache_k = torch.cat([self.cache_k, K], dim=2)
-            self.cache_v = torch.cat([self.cache_v, V], dim=2)
+            self.cache_k, self.cache_v = K_all, V_all
+            self.scores = new_scores
 
-        # TRUNCATE to window size — discard old tokens!
-        if self.cache_k.shape[2] > self.window_size:
-            self.cache_k = self.cache_k[:, :, -self.window_size:, :]
-            self.cache_v = self.cache_v[:, :, -self.window_size:, :]
-
-        scores = torch.matmul(Q, self.cache_k.transpose(-2, -1)) / self.scale
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, self.cache_v)
-        out = out.transpose(1, 2).contiguous().view(B, 1, D)
-        return self.W_o(out)
+        out = attn @ V_all
+        return self.W_o(out.transpose(1, 2).contiguous().view(B, 1, D))
 
 
 # ─────────────────────────────────────────────────────────────────
-# DEMO: Comparing approaches
+# DEMOS
 # ─────────────────────────────────────────────────────────────────
 
-def demo_kv_cache_speedup():
-    """
-    Shows how KV cache grows and why it matters.
-    """
-    print("=== KV Cache Demo ===\n")
+def demo_kv_cache_sizes():
+    """Compare how much KV cache each architecture uses."""
+    print("\n" + "=" * 62)
+    print("  KV Cache Memory Comparison (Llama-2 7B scale, float16)")
+    print("=" * 62)
 
-    d_model = 512
-    num_heads = 8
-    batch = 1
-    vocab_size = 1000
-
-    # Simulate token embeddings
-    embed = nn.Embedding(vocab_size, d_model)
-    kv_attn = KVCacheAttention(d_model, num_heads)
-
-    # Fake prompt: 10 tokens
-    prompt_ids = torch.randint(0, vocab_size, (batch, 10))
-    prompt_emb = embed(prompt_ids)  # [1, 10, 512]
-
-    print("PREFILL: processing 10-token prompt...")
-    _ = kv_attn.prefill(prompt_emb)
-    print(f"  Cache shape after prefill: {kv_attn.cache_k.shape}")
-    # [batch, heads, seq_len, head_dim] = [1, 8, 10, 64]
-
-    print("\nDECODE: generating 5 new tokens...")
-    for step in range(5):
-        new_token_id = torch.randint(0, vocab_size, (batch, 1))
-        new_emb = embed(new_token_id)  # [1, 1, 512]
-        _ = kv_attn.decode_step(new_emb)
-        print(f"  Step {step+1}: cache now holds {kv_attn.cache_k.shape[2]} tokens")
-
-    print("\nFinal cache sizes:")
-    K_bytes = kv_attn.cache_k.nelement() * 4  # float32 = 4 bytes
-    V_bytes = kv_attn.cache_v.nelement() * 4
-    print(f"  K cache: {K_bytes / 1024:.1f} KB")
-    print(f"  V cache: {V_bytes / 1024:.1f} KB")
-    print(f"  Total: {(K_bytes + V_bytes) / 1024:.1f} KB")
-
-
-def demo_gqa_memory_savings():
-    """
-    Shows how GQA reduces KV cache size.
-    """
-    print("\n=== GQA Memory Savings Demo ===\n")
-
-    d_model = 512
-    seq_len = 1000
-
+    # Llama-2 7B real dimensions
+    LAYERS, SEQ, DTYPE = 32, 4096, 2
     configs = [
-        ("MHA (32 Q, 32 KV)", 32, 32),
-        ("GQA (32 Q, 8 KV)",  32,  8),
-        ("MQA (32 Q, 1 KV)",  32,  1),
+        ("MHA  (32 KV heads)", 32, 32,  None),
+        ("GQA  (8 KV heads)",  32,  8,  None),
+        ("MQA  (1 KV head)",   32,  1,  None),
+        ("MLA  (latent d=128)", 32, 32,  128),   # MLA: 128-dim latent
     ]
 
-    for name, num_q, num_kv in configs:
-        head_dim = d_model // num_q
-        # KV cache: 2 (K+V) × num_kv_heads × seq_len × head_dim × 2 bytes (float16)
-        cache_bytes = 2 * num_kv * seq_len * head_dim * 2
-        print(f"  {name:<25} KV cache for {seq_len} tokens: {cache_bytes/1024:.1f} KB")
+    def fmt(b: int) -> str:
+        if b >= 1_000_000_000: return f"{b/1e9:.2f} GB"
+        if b >= 1_000_000:     return f"{b/1e6:.1f} MB"
+        return f"{b/1e3:.0f} KB"
+
+    print(f"\n  {'Method':<22} {'Per token':>10}  {'@4K ctx':>10}  {'vs MHA'}")
+    print(f"  {'──────':<22} {'─────────':>10}  {'───────':>10}  {'──────'}")
+
+    mha_per = None
+    for name, layers, kv_heads, latent_d in configs:
+        d_h = 128  # head dim
+        if latent_d is not None:
+            per = layers * latent_d * DTYPE            # MLA: one latent per layer
+        else:
+            per = 2 * layers * kv_heads * d_h * DTYPE  # standard: K + V
+        ctx4 = per * SEQ
+        if mha_per is None:
+            mha_per = ctx4
+        ratio = f"{mha_per / ctx4:.0f}x smaller" if ctx4 < mha_per else "baseline"
+        print(f"  {name:<22} {fmt(per):>10}  {fmt(ctx4):>10}  {ratio}")
+
+    print()
+
+
+def demo_speed_comparison():
+    """Measure wall-clock decode speed: Naive vs KV Cache."""
+    print("=" * 62)
+    print("  Speed: Naive Attention vs KV Cache Attention")
+    print("=" * 62)
+
+    torch.manual_seed(42)
+    D, H, PROMPT, GEN = 256, 8, 30, 40
+
+    embed = nn.Embedding(500, D)
+    naive = NaiveAttention(D, H)
+    kv    = KVCacheAttention(D, H)
+
+    tokens = torch.randint(0, 500, (1, PROMPT + GEN))
+    embs   = embed(tokens)
+
+    # Naive: feed entire growing history each step
+    t0, nc_times = time.perf_counter(), []
+    hist = embs[:, :PROMPT, :]
+    for i in range(GEN):
+        with torch.no_grad():
+            naive(hist)
+        nc_times.append((time.perf_counter() - t0) * 1000)
+        t0 = time.perf_counter()
+        hist = torch.cat([hist, embs[:, PROMPT + i:PROMPT + i + 1, :]], dim=1)
+
+    # KV Cache: prefill once, decode one token at a time
+    kv.prefill(embs[:, :PROMPT, :])
+    t0, kv_times = time.perf_counter(), []
+    for i in range(GEN):
+        with torch.no_grad():
+            kv.decode_step(embs[:, PROMPT + i:PROMPT + i + 1, :])
+        kv_times.append((time.perf_counter() - t0) * 1000)
+        t0 = time.perf_counter()
+
+    avg_nc, avg_kv = sum(nc_times) / len(nc_times), sum(kv_times) / len(kv_times)
+    print(f"\n  Prompt={PROMPT}, Generate={GEN}, d_model={D}, heads={H}")
+    print(f"\n  {'Method':<18} {'Avg ms/step':>12}  {'Total ms':>10}")
+    print(f"  {'──────':<18} {'───────────':>12}  {'────────':>10}")
+    print(f"  {'Naive':18} {avg_nc:>12.3f}  {sum(nc_times):>10.1f}")
+    print(f"  {'KV Cache':18} {avg_kv:>12.3f}  {sum(kv_times):>10.1f}")
+    print(f"\n  KV Cache is {avg_nc / avg_kv:.1f}x faster per step\n")
+
+
+def demo_gqa_vs_mla():
+    """Show GQA and MLA cache footprint differences in practice."""
+    print("=" * 62)
+    print("  GQA vs MLA: Cache Growth Over 50 Decode Steps")
+    print("=" * 62)
+
+    torch.manual_seed(0)
+    D, GEN = 256, 50
+    PROMPT = 10
+
+    gqa_mha = GroupedQueryAttention(D, num_q_heads=8, num_kv_heads=8)
+    gqa_4   = GroupedQueryAttention(D, num_q_heads=8, num_kv_heads=2)
+    mla     = MLAAttention(D, num_heads=8, latent_dim=32)   # 32 << 8×32=256
+
+    tokens = torch.randn(1, PROMPT + GEN, D)
+    for m in [gqa_mha, gqa_4, mla]:
+        m.prefill(tokens[:, :PROMPT, :]) if hasattr(m, 'prefill') else None
+
+    print(f"\n  d_model={D}, {PROMPT}-token prompt, {GEN} decode steps")
+    print(f"\n  {'Step':>5}  {'MHA KV':>10}  {'GQA-4 KV':>10}  {'MLA latent':>12}  ratio MHA/MLA")
+    print(f"  {'────':>5}  {'──────':>10}  {'────────':>10}  {'──────────':>12}")
+
+    for i in range(0, GEN, 10):
+        tok = tokens[:, PROMPT + i:PROMPT + i + 1, :]
+        gqa_mha.decode_step(tok)
+        gqa_4.decode_step(tok)
+        mla.decode_step(tok)
+
+        b_mha = gqa_mha.kv_cache_bytes()
+        b_gqa = gqa_4.kv_cache_bytes()
+        b_mla = mla.kv_cache_bytes()
+        print(f"  {i+1:>5}  {b_mha/1024:>8.1f}KB  {b_gqa/1024:>8.1f}KB  "
+              f"{b_mla/1024:>10.1f}KB  {b_mha / b_mla:.1f}x")
+
+    print()
+
+
+def demo_streamingllm():
+    """Show StreamingLLM attention sinks keeping memory fixed."""
+    print("=" * 62)
+    print("  StreamingLLM: Fixed Memory for Infinite Context")
+    print("=" * 62)
+
+    torch.manual_seed(7)
+    D, H = 128, 4
+    SINK, WIN = 4, 16
+    STEPS = 40
+
+    full   = KVCacheAttention(D, H)
+    stream = StreamingLLMAttention(D, H, sink_size=SINK, window_size=WIN)
+
+    tokens = torch.randn(STEPS, D)
+    full.prefill(tokens[:SINK].unsqueeze(0))
+    stream.prefill(tokens[:SINK].unsqueeze(0))
+
+    print(f"\n  Sinks={SINK}, Window={WIN}, max cache = {SINK+WIN}")
+    print(f"  {'Step':>5}  {'Full cache':>12}  {'Stream cache':>14}  Note")
+    print(f"  {'────':>5}  {'──────────':>12}  {'────────────':>14}")
+
+    for i in range(SINK, STEPS):
+        tok = tokens[i].unsqueeze(0).unsqueeze(0)
+        full.decode_step(tok)
+        stream.decode_step(tok)
+        note = " ← CAPPED" if stream.cache_tokens == SINK + WIN else ""
+        print(f"  {i+1:>5}  {full.cache_tokens:>12}  {stream.cache_tokens:>14}{note}")
+
+    print(f"\n  Full cache at end:   {full.cache_tokens} tokens (grows forever)")
+    print(f"  Stream cache at end: {stream.cache_tokens} tokens "
+          f"(capped at {SINK + WIN} regardless of length)\n")
 
 
 if __name__ == "__main__":
-    demo_kv_cache_speedup()
-    demo_gqa_memory_savings()
+    print("\n" + "=" * 62)
+    print("  06 Code Examples — KV Cache Implementations")
+    print("=" * 62)
 
-    print("\n=== Sliding Window Cache Demo ===")
-    print("Window size = 4. Cache never exceeds 4 tokens:")
-    sw = SlidingWindowAttention(d_model=64, num_heads=4, window_size=4)
-    emb = nn.Embedding(100, 64)
+    demo_kv_cache_sizes()
+    demo_speed_comparison()
+    demo_gqa_vs_mla()
+    demo_streamingllm()
+
+    # Quick sliding-window sanity check
+    print("=" * 62)
+    print("  Sliding Window (window=4, 8 steps)")
+    print("=" * 62)
+    sw = SlidingWindowAttention(64, 4, window_size=4)
     for i in range(8):
-        tok = torch.randint(0, 100, (1, 1))
-        sw.decode_step(emb(tok))
-        print(f"  After token {i+1}: cache size = {sw.cache_k.shape[2]}")
+        sw.decode_step(torch.randn(1, 1, 64))
+        print(f"  Step {i+1}: cache = {sw.cache_tokens} tokens")
+    print()
