@@ -200,6 +200,48 @@ With PREFIX CACHE (same document asked again):
 
 ---
 
+## TOKEN EVICTION METHODS (Chapter 8)
+
+```
+METHOD          EVICTION STRATEGY              GRANULARITY   MEMORY BOUND
+──────────────  ─────────────────────────────  ────────────  ────────────
+H2O             Cumulative attention score      Per-token     Fixed budget
+StreamingLLM    Sinks + sliding window          Fixed window  Sinks + W
+SnapKV          Observation window prediction   Per-head      Fixed budget
+PyramidKV       Layer-wise budget (pyramid)     Per-layer     Layer budget
+ScissorHands    Recency-aware persistence       Per-token     Fixed budget
+DuoAttention    Retrieval vs streaming heads    Per-head      Mixed
+
+When to use:
+  Infinite streaming context?  → StreamingLLM
+  Long prompt, short output?   → SnapKV (predicts at prefill time)
+  Can profile model offline?   → DuoAttention (best quality/size ratio)
+  Simplest implementation?     → H2O (cumulative score, easy to add)
+  Need per-layer control?      → PyramidKV
+```
+
+---
+
+## 2024 SYSTEMS QUICK REFERENCE (Chapter 9)
+
+```
+SYSTEM          CORE INNOVATION                 BEST FOR
+──────────────  ─────────────────────────────  ─────────────────────────
+vLLM            PagedAttention (OS paging)      General purpose (production)
+SGLang          RadixAttention (trie prefix)    Multi-call programs, batch Q&A
+vAttention      CUDA VMM (hardware paging)      Long context, low overhead
+DistServe       Disaggregated prefill/decode    High throughput pipelines
+Mooncake        KV pool management (ByteDance)  Multi-node production scale
+TensorRT-LLM    Hardware fusion (NVIDIA)        Max NVIDIA performance
+
+API Prefix Caching:
+  Anthropic Claude:  explicit cache_control parameter
+  OpenAI:            automatic (cache_read_input_tokens in response)
+  Google Gemini:     explicit CachedContent object with TTL
+```
+
+---
+
 ## QUICK REFERENCE: VOCABULARY
 
 ```
@@ -213,18 +255,31 @@ TPOT                Time Per Output Token — pace of generation
 MHA                 Multi-Head Attention — standard full KV per head
 GQA                 Grouped Query Attention — fewer KV heads (4-8x savings)
 MQA                 Multi-Query Attention — single KV head (32x savings)
-PagedAttention      Virtual memory system for KV cache (vLLM)
+MLA                 Multi-head Latent Attention — compressed latent (5-13x)
+CLA                 Cross-Layer Attention — share K/V across layers (~2x)
+PagedAttention      OS-style virtual memory for KV cache (vLLM)
+vAttention          CUDA VMM hardware paging for KV cache
+RadixAttention      Trie-based prefix caching (SGLang)
 Prefix Caching      Reuse KV for identical prompt prefixes
 Continuous Batching Fill GPU with new requests as old ones finish
-Flash Attention     Memory-efficient attention computation (not caching)
+Flash Attention     IO-aware attention (FA1/FA2/FA3) — not a KV cache tech
+Flash Attention 3   H100 Hopper-specific FA with WGMMA + TMA (1.5-2x FA2)
 Context Window      Maximum total tokens (prompt + output) model can handle
 Sequence Length     Number of tokens in a request
 Batch Size          Number of simultaneous requests processed together
 HBM                 High Bandwidth Memory — the GPU's main VRAM
 SRAM                On-chip memory — tiny but extremely fast
-KV Quantization     Compress K,V values (INT8/FP8) to save memory
-Token Eviction      Discard low-importance tokens from cache (H2O)
+KV Quantization     Compress K,V values (INT8/FP8/INT4) to save memory
+Token Eviction      Discard low-importance tokens from cache
+Heavy Hitter        Token that receives disproportionately high attention
+Attention Sink      Initial tokens that always receive high attention (structural)
 Sliding Window      Fixed-size rolling KV cache window
+H2O                 Heavy-Hitter Oracle — cumulative score eviction
+SnapKV              Observation-window prediction at prefill time
+StreamingLLM        Attention sinks + sliding window for infinite streaming
+PyramidKV           Layer-wise budget allocation (pyramid shape)
+DuoAttention        Retrieval heads (full cache) vs streaming heads (sparse)
+DistServe           Disaggregated prefill/decode serving system
 ```
 
 ---

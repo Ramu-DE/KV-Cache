@@ -7,25 +7,49 @@ Everything about KV Cache, from zero to production.
 Go in order. Each chapter builds on the last.
 
 ```
-01_basics.md           ← Start here. What KV cache is and why it exists.
-02_memory_and_size.md  ← How big it gets, why that matters, the math.
-03_optimizations.md    ← GQA, PagedAttention, prefix caching, and more.
-04_advanced_topics.md  ← Quantization, sliding window, MLA, ring attention.
-05_systems_and_serving.md ← vLLM, multi-GPU, production deployment.
-06_code_examples.py    ← Working PyTorch implementations you can run.
-07_visual_cheatsheet.md ← Everything condensed onto one reference page.
+FOUNDATIONS
+  01_basics.md              ← Start here. What KV cache is and why it exists.
+  02_memory_and_size.md     ← How big it gets, why that matters, the math.
+
+CORE OPTIMIZATIONS
+  03_optimizations.md       ← GQA, PagedAttention, prefix caching, Flash Attention.
+  04_advanced_topics.md     ← Quantization, offloading, H2O, MLA, ring attention.
+
+PRODUCTION SYSTEMS
+  05_systems_and_serving.md ← vLLM, multi-GPU, disaggregated serving.
+
+CODE
+  06_code_examples.py       ← PyTorch: NaiveAttention, KVCache, GQA, SlidingWindow.
+  demo_eviction.py          ← H2O, StreamingLLM, SnapKV eviction demos.
+  run_demo.py               ← numpy: speed, memory, cache growth (CPU-only).
+  run_demo_torch.py         ← PyTorch: tensor shapes, speed, GQA, prefix cache.
+  simulate.py               ← Real-text simulation with actual sentences.
+
+REFERENCE
+  07_visual_cheatsheet.md   ← Everything on one page including 2024 systems.
+
+NEW (2024-2025 RESEARCH)
+  08_token_eviction.md      ← H2O, SnapKV, PyramidKV, ScissorHands, DuoAttention.
+  09_systems_2024.md        ← SGLang/RadixAttention, vAttention, DistServe, Mooncake,
+                              API prefix caching (Claude/OpenAI/Gemini), FastGen.
+  10_emerging_2024_2025.md  ← Flash Attention 3, CLA, KVSharer, CacheGen, InfiniGen,
+                              research taxonomy, open problems, full paper index.
 ```
 
 ## The One-Paragraph Summary
 
 An LLM generates one token at a time. Without KV cache, it would
-re-process the entire conversation history for each new token — O(n²)
-cost. KV cache stores the Key and Value tensors computed for previous
-tokens so only the new token needs processing — O(n) cost. The cache
-lives in GPU VRAM, grows with each token, and is the primary reason
-long-context inference is expensive. Modern systems optimize it through
-smaller architectures (GQA), virtual memory (PagedAttention), shared
-prefix reuse (prefix caching), and quantization (INT8/FP8).
+re-process the entire conversation history for each new token — O(n³)
+total cost. KV cache stores the Key and Value tensors computed for
+previous tokens so only the new token needs processing — O(n²) total.
+The cache lives in GPU VRAM, grows with each token, and is the primary
+reason long-context inference is expensive. Modern systems reduce this
+through smaller architectures (GQA, MLA), virtual memory (PagedAttention,
+vAttention), shared prefix reuse (RadixAttention/SGLang), token eviction
+(H2O, SnapKV, DuoAttention), quantization (INT8/FP8), and disaggregated
+serving (DistServe, Mooncake). Flash Attention 3 (2024) accelerates
+prefill on H100 GPUs. All findings in chapters 8-10 are verified against
+primary papers using adversarial fact-checking.
 
 ## Prerequisites
 

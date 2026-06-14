@@ -247,9 +247,10 @@ Big model:    verifies using its large KV cache in parallel
 
 ---
 
-## 6. Flash Attention (Compute Optimization)
+## 6. Flash Attention Family (Compute Optimization)
 
-Though not strictly a KV Cache technique, Flash Attention changes HOW attention is computed and affects cache memory movement.
+Though not strictly a KV Cache technique, Flash Attention changes HOW
+attention is computed and affects cache memory movement.
 
 ```
 STANDARD ATTENTION:
@@ -259,24 +260,59 @@ STANDARD ATTENTION:
   
   Memory reads: O(seq²)   ← bottleneck for long sequences
 
-FLASH ATTENTION:
+FLASH ATTENTION 1 (Dao et al., 2022 — arxiv:2205.14135):
   1. Split Q, K, V into BLOCKS that fit in SRAM (fast on-chip memory)
-  2. Compute attention block by block
+  2. Compute attention block by block using online softmax
   3. Never write large QK^T matrix to HBM
   
   Memory reads: O(seq)    ← much better!
+  IO complexity: O(N²·d / M) where M = SRAM size
+
+FLASH ATTENTION 2 (Dao, 2023 — arxiv:2307.08691):
+  Improvements over FA1:
+  - Better parallelism across sequence positions and heads
+  - Reduced non-matmul FLOPs (causal masking optimization)
+  - 2-4× faster than FA1 on A100
+  - Supports Multi-Query and Grouped-Query Attention natively
+
+FLASH ATTENTION 3 (Shah et al., 2024 — arxiv:2407.08608):
+  H100 Hopper GPU specific — exploits new hardware features:
+  - WGMMA: asynchronous warpgroup matrix multiply (overlaps compute + memory)
+  - TMA: Tensor Memory Accelerator for async data prefetching
+  - Pipeline stages: load next tile while computing on current tile
+  
+  Performance on H100 (fp16):
+    FA2: ~330 TFLOPS/s
+    FA3: ~470-570 TFLOPS/s  (1.5-2.0× faster than FA2)
+    Peak H100: ~1979 TFLOPS/s (FA3 reaches ~75% utilization)
 
   GPU Memory Hierarchy:
   ┌──────────────┐  SRAM (on-chip)   ~192 KB   extremely fast
-  │   SRAM       │  
+  │   SRAM       │  ← Flash Attention keeps computation here
   └──────────────┘
         │ 10x slower
   ┌──────────────┐  HBM (GPU RAM)    ~40-80 GB  fast
-  │   HBM        │
+  │   HBM        │  ← Standard attention writes N×N matrix here (slow)
   └──────────────┘
-  
-  Flash Attention keeps computation in SRAM as long as possible.
 ```
+
+**Note:** Flash Attention speeds up the prefill phase (compute-bound).
+During decode, the bottleneck is reading the KV cache (memory-bound),
+not computing attention — so FA3 helps less during decode.
+
+## 6b. SGLang and RadixAttention
+
+SGLang (2024) introduced **RadixAttention** — using a radix tree (trie)
+instead of a hash table for prefix caching. This enables:
+- Partial prefix matches across requests (not just exact hashes)
+- Tree-aware LRU eviction (leaf nodes evicted first, shared trunks preserved)
+- Automatic cross-request KV sharing even for dynamic prompts
+
+Compared to vLLM's prefix caching, SGLang achieves significantly higher
+cache hit rates for multi-call programs (agent loops, batch document Q&A).
+
+See `09_systems_2024.md` for full coverage of SGLang, vAttention,
+DistServe, and Mooncake.
 
 ---
 
